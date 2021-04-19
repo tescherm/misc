@@ -1,7 +1,6 @@
 package deck
 
 import (
-	"bufio"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
@@ -102,40 +101,50 @@ var Faces = []Face{
 type Deck struct {
 	sync.RWMutex
 
-	size int64
-	file string
-	rnd  *rand.Rand
+	topIdx int64
+
+	file  *os.File
+	cards mmap.MMap
+	rnd   *rand.Rand
 }
 
 func NewDeck(iterations int64) (*Deck, error) {
 	f, err := os.CreateTemp("", "deck")
 	if err != nil {
-		return nil, fmt.Errorf("create deck file failed")
+		return nil, fmt.Errorf("create deck file failed: %w", err)
 	}
 
-	defer f.Close()
+	deckSize := iterations * int64(len(Faces)) * int64(len(Values))
+	err = f.Truncate(deckSize)
+	if err != nil {
+		return nil, fmt.Errorf("deck truncate failed: %w", err)
+	}
 
-	w := bufio.NewWriter(f)
+	cards, err := mmap.Map(f, mmap.RDWR, 0)
+	if err != nil {
+		return nil, fmt.Errorf("deck mmap failed: %w", err)
+	}
+
+	currentSize := int64(0)
 	for i := int64(0); i < iterations; i++ {
 		for _, face := range Faces {
 			for _, value := range Values {
 				card := NewCard(value, face)
-				err = w.WriteByte(byte(card))
-				if err != nil {
-					return nil, fmt.Errorf("error writing card: %w", err)
-				}
+				cards[currentSize] = byte(card)
+				currentSize++
 			}
 		}
 	}
 
-	err = w.Flush()
+	err = cards.Flush()
 	if err != nil {
 		return nil, fmt.Errorf("deck flush failed: %w", err)
 	}
 
 	deck := &Deck{
-		size: iterations * int64(len(Faces)) * int64(len(Values)),
-		file: f.Name(),
+		topIdx: currentSize - 1,
+		file:   f,
+		cards:  cards,
 
 		rnd: rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
@@ -147,27 +156,31 @@ func (d *Deck) Size() int64 {
 	d.RLock()
 	defer d.RUnlock()
 
-	return d.size
+	return d.topIdx + 1
+}
+
+func (d *Deck) Close() error {
+	err := d.cards.Flush()
+	if err != nil {
+		return fmt.Errorf("deck file %s flush failed: %w", d.file.Name(), err)
+	}
+	err = d.cards.Unmap()
+	if err != nil {
+		return fmt.Errorf("deck file %s unmap failed: %w", d.file.Name(), err)
+	}
+	err = d.file.Close()
+	if err != nil {
+		return fmt.Errorf("deck file %s close failed: %w", d.file.Name(), err)
+	}
+	return nil
 }
 
 func (d *Deck) Print() error {
 	d.RLock()
 	defer d.RUnlock()
 
-	f, err := os.OpenFile(d.file, os.O_RDONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("open deck file %s failed: %w", d.file, err)
-	}
-
-	reader := bufio.NewReader(f)
-
-	for i := int64(0); i < d.size; i++ {
-		b, err := reader.ReadByte()
-		if err != nil {
-			return fmt.Errorf("read card failed: %w", err)
-		}
-
-		card := Card(b)
+	for i := int64(0); i < d.topIdx; i++ {
+		card := Card(d.cards[i])
 		fmt.Printf("%s\n", card.String())
 	}
 
@@ -178,28 +191,12 @@ func (d *Deck) Deal() (*Card, error) {
 	d.Lock()
 	defer d.Unlock()
 
-	f, err := os.OpenFile(d.file, os.O_RDWR, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("open deck file %s failed: %w", d.file, err)
-	}
-
-	if d.size == 0 {
+	if d.topIdx < 0 {
 		return nil, fmt.Errorf("deal called on an empty deck")
 	}
 
-	buf := make([]byte, 1)
-	_, err = f.ReadAt(buf, d.size-1)
-	if err != nil {
-		return nil, fmt.Errorf("read card failed: %w", err)
-	}
-
-	d.size--
-	err = f.Truncate(d.size)
-	if err != nil {
-		return nil, fmt.Errorf("deck file %s truncate failed: %w", d.file, err)
-	}
-
-	card := Card(buf[0])
+	card := Card(d.cards[d.topIdx])
+	d.topIdx--
 	return &card, nil
 }
 
@@ -211,19 +208,8 @@ func (d *Deck) Return(c *Card) error {
 		return fmt.Errorf("cannot return a nil card")
 	}
 
-	f, err := os.OpenFile(d.file, os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("open deck file %s failed: %w", d.file, err)
-	}
-
-	defer f.Close()
-
-	_, err = f.Write([]byte{byte(*c)})
-	if err != nil {
-		return fmt.Errorf("card return failed: %w", err)
-	}
-
-	d.size++
+	d.topIdx++
+	d.cards[d.topIdx] = byte(*c)
 
 	return nil
 }
@@ -232,51 +218,32 @@ func (d *Deck) Shuffle() error {
 	d.Lock()
 	defer d.Unlock()
 
-	f, err := os.OpenFile(d.file, os.O_RDWR, 0644)
+	fisherYatesShuffle(d.cards, d.topIdx, d.rnd)
+
+	return nil
+}
+
+func ShuffleSimple(filename string) error {
+	cards, err := ioutil.ReadFile(filename)
 	if err != nil {
-		return fmt.Errorf("open deck file %s failed: %w", d.file, err)
+		return fmt.Errorf("read deck file %s failed: %w", filename, err)
 	}
 
-	defer f.Close()
-	cards, err := mmap.Map(f, mmap.RDWR, 0)
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	fisherYatesShuffle(cards, int64(len(cards)), rnd)
+
+	err = ioutil.WriteFile(filename, cards, 0644)
 	if err != nil {
-		return fmt.Errorf("open deck file %s failed: %w", d.file, err)
-	}
-
-	defer cards.Unmap()
-
-	d.fisherYatesShuffle(cards)
-
-	err = cards.Flush()
-	if err != nil {
-		return fmt.Errorf("mmap flush failed: %w", err)
+		return fmt.Errorf("write deck file %s failed: %w", filename, err)
 	}
 
 	return nil
 }
 
-func (d *Deck) ShuffleSimple() error {
-	d.Lock()
-	defer d.Unlock()
-
-	cards, err := ioutil.ReadFile(d.file)
-	if err != nil {
-		return fmt.Errorf("read deck file %s failed: %w", d.file, err)
-	}
-
-	d.fisherYatesShuffle(cards)
-
-	err = ioutil.WriteFile(d.file, cards, 0644)
-	if err != nil {
-		return fmt.Errorf("write deck file %s failed: %w", d.file, err)
-	}
-
-	return nil
-}
-
-func (d *Deck) fisherYatesShuffle(arr []byte) {
-	for i := len(arr) - 1; i >= 0; i-- {
-		j := d.rnd.Intn(len(arr)-i) + i
+func fisherYatesShuffle(arr []byte, n int64, rnd *rand.Rand) {
+	for i := n - 1; i >= 0; i-- {
+		j := int64(rnd.Intn(int(n-i))) + i
 		tmp := arr[i]
 		arr[i] = arr[j]
 		arr[j] = tmp

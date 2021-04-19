@@ -12,6 +12,11 @@ func TestDeck(t *testing.T) {
 	deck, err := NewDeck(1)
 	require.NoError(t, err)
 
+	t.Cleanup(func() {
+		err = deck.Close()
+		require.NoError(t, err)
+	})
+
 	require.EqualValues(t, 52, deck.Size())
 
 	card, err := deck.Deal()
@@ -48,7 +53,7 @@ func TestDeck(t *testing.T) {
 	require.EqualValues(t, 52, deck.Size())
 }
 
-func BenchmarkDeck_Deal(b *testing.B) {
+func BenchmarkDeck_DealReturn(b *testing.B) {
 	b.ReportAllocs()
 
 	deck, err := NewDeck(1000)
@@ -56,23 +61,13 @@ func BenchmarkDeck_Deal(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err = deck.Deal()
+		card, err := deck.Deal()
+		err = deck.Return(card)
 		require.NoError(b, err)
 	}
-}
 
-func BenchmarkDeck_Return(b *testing.B) {
-	b.ReportAllocs()
-
-	deck, err := NewDeck(1)
+	err = deck.Close()
 	require.NoError(b, err)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		card := NewCard(ACE, SPADE)
-		err = deck.Return(&card)
-		require.NoError(b, err)
-	}
 }
 
 func BenchmarkDeck_ShuffleSimple(b *testing.B) {
@@ -81,9 +76,12 @@ func BenchmarkDeck_ShuffleSimple(b *testing.B) {
 	deck, err := NewDeck(1000)
 	require.NoError(b, err)
 
+	err = deck.Close()
+	require.NoError(b, err)
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		err = deck.ShuffleSimple()
+		err = ShuffleSimple(deck.file.Name())
 		require.NoError(b, err)
 	}
 }
@@ -99,4 +97,7 @@ func BenchmarkDeck_ShuffleMMap(b *testing.B) {
 		err = deck.Shuffle()
 		require.NoError(b, err)
 	}
+
+	err = deck.Close()
+	require.NoError(b, err)
 }
